@@ -3,7 +3,7 @@ use crate::connection::ConnectOptions;
 use crate::connection::Connection;
 use crate::database::Database;
 use crate::error::Error;
-use crate::pool::{deadline_as_timeout, CloseEvent, Pool, PoolOptions};
+use crate::pool::{deadline_as_timeout, CloseEvent, Pool, PoolConnectMetadata, PoolOptions};
 use crossbeam_queue::ArrayQueue;
 use futures_core::future::BoxFuture;
 
@@ -345,6 +345,8 @@ impl<DB: Database> PoolInner<DB> {
             return Err(Error::PoolClosed);
         }
 
+        let start = Instant::now();
+        let mut num_attempts = 0u32;
         let mut backoff = Duration::from_millis(10);
         let max_backoff = deadline_as_timeout(deadline)? / 5;
 
@@ -363,7 +365,13 @@ impl<DB: Database> PoolInner<DB> {
             // if this block does not return, sleep for the backoff timeout and try again
             let connect_fut: BoxFuture<'_, Result<DB::Connection, Error>> =
                 if let Some(connector) = &self.options.connector {
-                    connector(&connect_options)
+                    connector(PoolConnectMetadata {
+                        connect_options: connect_options.clone(),
+                        start,
+                        deadline,
+                        num_attempts,
+                        pool_size: self.size(),
+                    })
                 } else {
                     Box::pin(connect_options.connect())
                 };
@@ -412,6 +420,7 @@ impl<DB: Database> PoolInner<DB> {
             // If the connection is refused, wait in exponentially
             // increasing steps for the server to come up,
             // capped by a factor of the remaining time until the deadline
+            num_attempts = num_attempts.saturating_add(1);
             crate::rt::sleep(backoff).await;
             backoff = cmp::min(backoff * 2, max_backoff);
         }

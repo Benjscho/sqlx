@@ -804,3 +804,92 @@ async fn test_client_found_rows() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+mod custom_transport {
+    use super::*;
+
+    async fn check_connection(
+        mut conn: MySqlConnection,
+        options: &MySqlConnectOptions,
+    ) -> anyhow::Result<()> {
+        conn.ping().await?;
+        let value: (i32,) = sqlx::query_as("SELECT 1 + 1").fetch_one(&mut conn).await?;
+        assert_eq!(value.0, 2);
+        let payload = "custom transport ".repeat(2048);
+        let echoed: String = sqlx::query_scalar("SELECT ?")
+            .bind(&payload)
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(echoed, payload);
+        if matches!(
+            options.get_ssl_mode(),
+            sqlx::mysql::MySqlSslMode::Required
+                | sqlx::mysql::MySqlSslMode::VerifyCa
+                | sqlx::mysql::MySqlSslMode::VerifyIdentity
+        ) {
+            let (_, cipher): (String, String) =
+                sqlx::query_as("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+                    .fetch_one(&mut conn)
+                    .await?;
+            assert!(!cipher.is_empty(), "TLS required by connection options");
+        }
+        let timezone: String = sqlx::query_scalar("SELECT @@session.time_zone")
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(timezone, "+08:00");
+        conn.close().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "_rt-tokio")]
+    mod tokio {
+        use super::*;
+
+        #[sqlx_macros::test]
+        async fn connects_with_stream() -> anyhow::Result<()> {
+            setup_if_needed();
+            let options = env::var("DATABASE_URL")?
+                .parse::<MySqlConnectOptions>()?
+                .timezone(Some("+08:00".into()));
+            for _ in 0..2 {
+                let stream =
+                    ::tokio::net::TcpStream::connect((options.get_host(), options.get_port()))
+                        .await?;
+                // Require flushing and exercise short writes through a custom transport.
+                let stream = ::tokio::io::BufStream::with_capacity(64, 64, stream);
+                let conn = options.connect_with_stream_tokio(stream).await?;
+                check_connection(conn, &options).await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(any(
+        feature = "_rt-async-std",
+        feature = "_rt-smol",
+        feature = "_rt-async-global-executor"
+    ))]
+    mod futures {
+        use super::*;
+
+        #[sqlx_macros::test]
+        async fn connects_with_stream() -> anyhow::Result<()> {
+            setup_if_needed();
+            let options = env::var("DATABASE_URL")?
+                .parse::<MySqlConnectOptions>()?
+                .timezone(Some("+08:00".into()));
+            for _ in 0..2 {
+                let address = std::net::ToSocketAddrs::to_socket_addrs(&(
+                    options.get_host(),
+                    options.get_port(),
+                ))?
+                .next()
+                .expect("database address");
+                let stream = async_io::Async::<std::net::TcpStream>::connect(address).await?;
+                let conn = options.connect_with_stream_futures(stream).await?;
+                check_connection(conn, &options).await?;
+            }
+            Ok(())
+        }
+    }
+}

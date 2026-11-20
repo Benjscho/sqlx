@@ -18,70 +18,81 @@ use rustls::{
 
 use crate::error::Error;
 use crate::io::ReadBuf;
-use crate::net::tls::util::StdSocket;
+use crate::net::tls::util::{polling, StdSocket};
 use crate::net::tls::TlsConfig;
 use crate::net::Socket;
 
 pub struct RustlsSocket<S: Socket> {
-    inner: StdSocket<S>,
+    inner: S,
     state: ClientConnection,
     close_notify_sent: bool,
 }
 
 impl<S: Socket> RustlsSocket<S> {
-    fn poll_complete_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            match self.state.complete_io(&mut self.inner) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready!(self.inner.poll_ready(cx))?;
-                }
-                ready => return Poll::Ready(ready.map(|_| ())),
-            }
+    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // Register both directions when writes are blocked. Incoming records
+        // can still make progress while the peer is not accepting our writes.
+        if let Poll::Ready(Err(error)) = self.poll_flush(cx) {
+            return Poll::Ready(Err(error));
         }
-    }
-
-    async fn complete_io(&mut self) -> io::Result<()> {
-        future::poll_fn(|cx| self.poll_complete_io(cx)).await
+        let read = ready!(polling(
+            self.state
+                .read_tls(&mut StdSocket::new(&mut self.inner, cx))
+        ))?;
+        if let Err(error) = self.state.process_new_packets() {
+            // Best effort: send any queued alert without masking the TLS error.
+            let _ = self.poll_flush(cx);
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
+        }
+        Poll::Ready(Ok(read))
     }
 }
 
 impl<S: Socket> Socket for RustlsSocket<S> {
-    fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
-        self.state.reader().read(buf.init_mut())
-    }
-
-    fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.state.writer().write(buf) {
-            // Returns a zero-length write when the buffer is full.
-            Ok(0) => Err(io::ErrorKind::WouldBlock.into()),
-            other => other,
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut dyn ReadBuf,
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match self.state.reader().read(buf.init_mut()) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.poll_receive(cx))?;
+                }
+                result => return Poll::Ready(result),
+            }
         }
     }
 
-    fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_complete_io(cx)
-    }
-
-    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_complete_io(cx)
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        loop {
+            match self.state.writer().write(buf) {
+                // Rustls returns zero when its plaintext buffer is full.
+                Ok(0) => {
+                    ready!(self.poll_flush(cx))?;
+                }
+                result => return Poll::Ready(result),
+            }
+        }
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Only write out the pending TLS records: once nothing is left to write,
-        // `poll_complete_io()` reads and waits for the peer to send something,
+        // reading would wait for the peer to send something,
         // so a close (which flushes first) would hang if the peer has nothing more to say.
         while self.state.wants_write() {
-            match self.state.write_tls(&mut self.inner) {
-                // The transport accepts no more; `complete_io()` treats this as EOF too.
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready!(self.inner.poll_ready(cx))?;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
+            match ready!(polling(
+                self.state
+                    .write_tls(&mut StdSocket::new(&mut self.inner, cx))
+            ))? {
+                0 => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                _ => {}
             }
         }
-        Poll::Ready(self.inner.flush())
+        self.inner.poll_flush(cx)
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -90,12 +101,12 @@ impl<S: Socket> Socket for RustlsSocket<S> {
             self.close_notify_sent = true;
         }
 
-        ready!(self.poll_complete_io(cx))?;
+        ready!(self.poll_flush(cx))?;
 
         // Server can close socket as soon as it receives the connection shutdown request.
         // We shouldn't expect it to stick around for the TLS session to close cleanly.
         // https://security.stackexchange.com/a/82034
-        let _ = ready!(self.inner.socket.poll_shutdown(cx));
+        let _ = ready!(self.inner.poll_shutdown(cx));
 
         Poll::Ready(Ok(()))
     }
@@ -215,13 +226,23 @@ where
     let host = ServerName::try_from(hostname.to_owned()).map_err(Error::tls)?;
 
     let mut socket = RustlsSocket {
-        inner: StdSocket::new(socket),
+        inner: socket,
         state: ClientConnection::new(connector.config.clone(), host).map_err(Error::tls)?,
         close_notify_sent: false,
     };
 
     // Performs the TLS handshake or bails
-    socket.complete_io().await?;
+    future::poll_fn(|cx| {
+        while socket.state.is_handshaking() {
+            if ready!(socket.poll_receive(cx))? == 0 {
+                return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+            }
+        }
+        // A buffered transport can return Pending after accepting the final
+        // handshake records. Retry its flush even once the handshake is done.
+        socket.poll_flush(cx)
+    })
+    .await?;
 
     Ok(socket)
 }
@@ -406,21 +427,17 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
     }
 
     impl Socket for SilentPeer {
-        fn try_read(&mut self, _buf: &mut dyn ReadBuf) -> io::Result<usize> {
-            Err(io::ErrorKind::WouldBlock.into())
-        }
-
-        fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.received.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn poll_read_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _buf: &mut dyn ReadBuf,
+        ) -> Poll<io::Result<usize>> {
             Poll::Pending
         }
 
-        fn poll_write_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+        fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.received.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -453,12 +470,8 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
         );
     }
 
-    // A flush with nothing left to write used to read and wait for the peer to send something,
-    // so a close, which flushes first, never ended if the peer had nothing more to say (#4449).
-    #[test]
-    fn flush_and_shutdown_do_not_wait_for_a_silent_peer() {
+    fn connections() -> (Arc<ClientConfig>, ServerConnection) {
         let mut cx = Context::from_waker(Waker::noop());
-
         // The client's config as `sslmode=require` builds it; loading no files, it's ready at once.
         let tls_config = TlsConfig {
             accept_invalid_certs: true,
@@ -481,7 +494,173 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
                 PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap(),
             )
             .unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        let server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        (config, server)
+    }
+
+    struct BufferedPeer {
+        server: ServerConnection,
+        outgoing: Vec<u8>,
+        incoming: Vec<u8>,
+        flush_pending: bool,
+    }
+
+    impl Socket for BufferedPeer {
+        fn poll_read(
+            &mut self,
+            _cx: &mut Context<'_>,
+            buf: &mut dyn ReadBuf,
+        ) -> Poll<io::Result<usize>> {
+            if !self.outgoing.is_empty() {
+                return Poll::Pending;
+            }
+            if self.incoming.is_empty() {
+                return Poll::Pending;
+            }
+            let buf = buf.init_mut();
+            let len = buf.len().min(self.incoming.len()).min(17);
+            buf[..len].copy_from_slice(&self.incoming[..len]);
+            self.incoming.drain(..len);
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let len = buf.len().min(17);
+            self.outgoing.extend_from_slice(&buf[..len]);
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if !self.flush_pending {
+                self.flush_pending = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.flush_pending = false;
+            deliver(&std::mem::take(&mut self.outgoing), &mut self.server);
+            while self.server.wants_write() {
+                self.server.write_tls(&mut self.incoming)?;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn bounded_poll<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..10_000 {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                return result;
+            }
+        }
+        panic!("TLS operation stalled");
+    }
+
+    #[test]
+    fn handshake_and_shutdown_retry_pending_transport_flushes() {
+        let (config, server) = connections();
+        let peer = BufferedPeer {
+            server,
+            outgoing: Vec::new(),
+            incoming: Vec::new(),
+            flush_pending: false,
+        };
+        let connector = RustlsConnector { config };
+        let mut socket = bounded_poll(handshake(peer, "localhost", &connector)).unwrap();
+        let payload = vec![42; 20_000];
+        bounded_poll(async {
+            let mut remaining = &payload[..];
+            while !remaining.is_empty() {
+                let written = socket.write(remaining).await.unwrap();
+                assert_ne!(written, 0);
+                remaining = &remaining[written..];
+            }
+            socket.shutdown().await.unwrap();
+        });
+        let mut received = Vec::new();
+        socket
+            .inner
+            .server
+            .reader()
+            .read_to_end(&mut received)
+            .unwrap();
+        assert_eq!(received, payload);
+        assert!(socket
+            .inner
+            .server
+            .process_new_packets()
+            .unwrap()
+            .peer_has_closed());
+    }
+
+    #[test]
+    fn reads_progress_while_outgoing_records_are_backpressured() {
+        struct BackpressuredPeer(io::Cursor<Vec<u8>>);
+
+        impl Socket for BackpressuredPeer {
+            fn poll_read(
+                &mut self,
+                _cx: &mut Context<'_>,
+                buf: &mut dyn ReadBuf,
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(self.0.read(buf.init_mut()))
+            }
+
+            fn poll_write(
+                &mut self,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+
+            fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (config, mut server) = connections();
+        let mut client =
+            ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
+        while client.is_handshaking() || server.is_handshaking() {
+            transfer(&mut client, &mut server);
+            transfer(&mut server, &mut client);
+        }
+        server.writer().write_all(b"response").unwrap();
+        let mut incoming = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut incoming).unwrap();
+        }
+        client.writer().write_all(b"request").unwrap();
+        let mut socket = RustlsSocket {
+            inner: BackpressuredPeer(io::Cursor::new(incoming)),
+            state: client,
+            close_notify_sent: false,
+        };
+        let mut output = [0; 8];
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            socket.poll_read(&mut cx, &mut &mut output[..]),
+            Poll::Ready(Ok(8))
+        ));
+        assert_eq!(&output, b"response");
+    }
+
+    // A flush with nothing left to write used to read and wait for the peer to send something,
+    // so a close, which flushes first, never ended if the peer had nothing more to say (#4449).
+    #[test]
+    fn flush_and_shutdown_do_not_wait_for_a_silent_peer() {
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let (config, mut server) = connections();
         let mut client =
             ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
 
@@ -492,13 +671,19 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
         }
 
         let mut socket = RustlsSocket {
-            inner: StdSocket::new(SilentPeer::default()),
+            inner: SilentPeer::default(),
             state: client,
             close_notify_sent: false,
         };
 
         // A write is flushed out.
-        assert_eq!(socket.try_write(b"ping").unwrap(), 4);
+        assert_eq!(
+            match socket.poll_write(&mut cx, b"ping") {
+                Poll::Ready(Ok(n)) => n,
+                other => panic!("{other:?}"),
+            },
+            4
+        );
         assert_ready_ok(socket.poll_flush(&mut cx));
 
         // With nothing left to write, a flush must not wait for the peer.
@@ -509,7 +694,7 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
         assert_ready_ok(pin!(socket.shutdown()).poll(&mut cx));
 
         // The peer got the write, then the close_notify.
-        deliver(&socket.into_inner().inner.socket.received, &mut server);
+        deliver(&socket.into_inner().inner.received, &mut server);
         let mut received = Vec::new();
         server.reader().read_to_end(&mut received).unwrap();
         assert_eq!(received, b"ping");

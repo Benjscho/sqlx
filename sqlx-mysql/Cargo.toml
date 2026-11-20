@@ -64,7 +64,7 @@ thiserror.workspace = true
 serde = { version = "1.0.219", optional = true }
 
 tokio = { workspace = true, optional = true }
-futures-io = { version = "0.3.32", optional = true }
+futures-io = { workspace = true, optional = true }
 
 [dev-dependencies]
 # FIXME: https://github.com/rust-lang/cargo/issues/15622

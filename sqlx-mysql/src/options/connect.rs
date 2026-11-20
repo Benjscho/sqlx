@@ -22,16 +22,8 @@ impl ConnectOptions for MySqlConnectOptions {
     where
         Self::Connection: Sized,
     {
-        let mut conn = MySqlConnection::establish(self).await?;
-
-        // After the connection is established, we initialize by configuring a few
-        // connection parameters
-
-        if let Some(statement) = self.connect_init_statement() {
-            conn.execute(AssertSqlSafe(statement)).await?;
-        }
-
-        Ok(conn)
+        self.initialize(MySqlConnection::establish(self).await?)
+            .await
     }
 
     fn log_statements(mut self, level: LevelFilter) -> Self {
@@ -46,6 +38,13 @@ impl ConnectOptions for MySqlConnectOptions {
 }
 
 impl MySqlConnectOptions {
+    async fn initialize(&self, mut conn: MySqlConnection) -> Result<MySqlConnection, Error> {
+        if let Some(statement) = self.connect_init_statement() {
+            conn.execute(AssertSqlSafe(statement)).await?;
+        }
+        Ok(conn)
+    }
+
     /// Build the `SET ...;` statement sent right after connecting.
     ///
     /// Kept as a pure function of the options (no I/O) so it can be
@@ -245,5 +244,55 @@ mod tests {
         assert_eq!(quote_string_literal("a\\'b"), "'a\\\\''b'");
         assert_eq!(quote_string_literal("plain"), "'plain'");
         assert_eq!(quote_string_literal("it's"), "'it''s'");
+    }
+}
+
+#[cfg(feature = "_rt-tokio")]
+impl MySqlConnectOptions {
+    /// Connect over a pre-connected tokio stream.
+    ///
+    /// Performs the database handshake and negotiates TLS using these options.
+    /// The configured hostname is still used for TLS certificate verification.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sqlx::mysql::MySqlConnectOptions;
+    ///
+    /// # async fn example() -> Result<(), sqlx::Error> {
+    /// let stream = tokio::net::TcpStream::connect("127.0.0.1:3306").await?;
+    /// let conn = MySqlConnectOptions::new()
+    ///     .connect_with_stream_tokio(stream)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_with_stream_tokio<S>(&self, stream: S) -> Result<MySqlConnection, Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        self.initialize(
+            MySqlConnection::establish_with_socket(crate::net::TokioStream::new(stream), self)
+                .await?,
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "_rt-async-io")]
+impl MySqlConnectOptions {
+    /// Connect over a pre-connected futures stream.
+    ///
+    /// Performs the database handshake and negotiates TLS using these options.
+    /// The configured hostname is still used for TLS certificate verification.
+    pub async fn connect_with_stream_futures<S>(&self, stream: S) -> Result<MySqlConnection, Error>
+    where
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        self.initialize(
+            MySqlConnection::establish_with_socket(crate::net::FuturesStream::new(stream), self)
+                .await?,
+        )
+        .await
     }
 }

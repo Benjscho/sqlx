@@ -194,6 +194,7 @@ uuid = "1.12.1"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 cfg-if = "1.0.0"
 dotenvy = { version = "0.15.7", default-features = false }
+futures-io = "0.3.32"
 thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 
 # Cryptography
@@ -239,6 +240,7 @@ time_ = { version = "0.3.47", package = "time" }
 futures-util = { version = "0.3.32", default-features = false, features = ["alloc"] }
 env_logger = "0.11"
 async-std = { workspace = true, features = ["attributes"] }
+async-io = "2.4.1"
 tokio = { version = "1.25.0", features = ["full"] }
 dotenvy = "0.15.7"
 trybuild = "1.0.53"
@@ -305,6 +307,11 @@ required-features = ["macros", "migrate"]
 #
 # SQLite
 #
+
+[[test]]
+name = "sqlite-pool-connector"
+path = "tests/sqlite/pool-connector.rs"
+required-features = ["sqlite", "macros"]
 
 [[test]]
 name = "sqlite"

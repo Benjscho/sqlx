@@ -125,6 +125,9 @@ impl<S: Socket> BufferedSocket<S> {
     pub async fn flush(&mut self) -> io::Result<()> {
         while !self.write_buf.is_empty() {
             let written = self.socket.write(self.write_buf.get()).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
             self.write_buf.consume(written);
             self.write_buf.sanity_check();
         }

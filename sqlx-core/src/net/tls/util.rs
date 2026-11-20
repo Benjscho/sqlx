@@ -1,78 +1,47 @@
 use crate::net::Socket;
-
-use std::future;
 use std::io::{self, Read, Write};
 use std::task::{Context, Poll};
 
-pub struct StdSocket<S> {
-    pub socket: S,
-    wants_read: bool,
-    wants_write: bool,
+/// A synchronous view of a socket for a single TLS poll.
+///
+/// Pending I/O has already registered the task's waker before returning WouldBlock.
+pub struct StdSocket<'s, 'c, 'w, S> {
+    socket: &'s mut S,
+    cx: &'c mut Context<'w>,
 }
 
-impl<S: Socket> StdSocket<S> {
-    pub fn new(socket: S) -> Self {
-        Self {
-            socket,
-            wants_read: false,
-            wants_write: false,
-        }
-    }
-
-    /// Returns `Ready` if a previously blocked read _or_ write may now proceed.
-    ///
-    /// If both a read and a write were attempted, to avoid deadlocks this returns `Ready`
-    /// when _either_ direction is ready, not necessarily both.
-    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Return `Ready` without waiting if the caller hasn't tried to do I/O in either direction.
-        let mut ready = !(self.wants_read || self.wants_write);
-
-        if self.wants_write && self.socket.poll_write_ready(cx)?.is_ready() {
-            self.wants_write = false;
-            ready |= true;
-        }
-
-        if self.wants_read && self.socket.poll_read_ready(cx)?.is_ready() {
-            self.wants_read = false;
-            ready |= true;
-        }
-
-        if ready {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    }
-
-    /// Returns successfully if a previously blocked read _or_ write may now proceed.
-    ///
-    /// If both a read and a write were attempted, to avoid deadlocks this returns when _either_
-    /// direction is ready, not necessarily both.
-    pub async fn ready(&mut self) -> io::Result<()> {
-        future::poll_fn(|cx| self.poll_ready(cx)).await
+impl<'s, 'c, 'w, S: Socket> StdSocket<'s, 'c, 'w, S> {
+    pub fn new(socket: &'s mut S, cx: &'c mut Context<'w>) -> Self {
+        Self { socket, cx }
     }
 }
 
-impl<S: Socket> Read for StdSocket<S> {
+impl<S: Socket> Read for StdSocket<'_, '_, '_, S> {
     fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        self.wants_read = true;
-        let read = self.socket.try_read(&mut buf)?;
-        self.wants_read = false;
-
-        Ok(read)
+        blocking(self.socket.poll_read(self.cx, &mut buf))
     }
 }
 
-impl<S: Socket> Write for StdSocket<S> {
+impl<S: Socket> Write for StdSocket<'_, '_, '_, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.wants_write = true;
-        let written = self.socket.try_write(buf)?;
-        self.wants_write = false;
-        Ok(written)
+        blocking(self.socket.poll_write(self.cx, buf))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // NOTE: TCP sockets and unix sockets are both no-ops for flushes
-        Ok(())
+        blocking(self.socket.poll_flush(self.cx))
+    }
+}
+
+pub fn blocking<T>(result: Poll<io::Result<T>>) -> io::Result<T> {
+    match result {
+        Poll::Ready(result) => result,
+        Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+    }
+}
+
+pub fn polling<T>(result: io::Result<T>) -> Poll<io::Result<T>> {
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+        result => Poll::Ready(result),
     }
 }

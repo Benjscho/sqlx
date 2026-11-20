@@ -2,7 +2,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll};
 
 use crate::io::ReadBuf;
 use crate::net::SocketHost;
@@ -10,18 +10,13 @@ pub use buffered::{BufferedSocket, WriteBuffer};
 use bytes::BufMut;
 use cfg_if::cfg_if;
 
-#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-io"))]
-pub mod async_rw_adapter;
 mod buffered;
 
 pub trait Socket: Send + Sync + Unpin + 'static {
-    fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize>;
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut dyn ReadBuf)
+        -> Poll<io::Result<usize>>;
 
-    fn try_write(&mut self, buf: &[u8]) -> io::Result<usize>;
-
-    fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
-
-    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
 
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // `flush()` is a no-op for TCP/UDS
@@ -74,16 +69,10 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
 
-        while this.buf.has_remaining_mut() {
-            match this.socket.try_read(&mut *this.buf) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready!(this.socket.poll_read_ready(cx))?;
-                }
-                ready => return Poll::Ready(ready),
-            }
+        if !this.buf.has_remaining_mut() {
+            return Poll::Ready(Ok(0));
         }
-
-        Poll::Ready(Ok(0))
+        this.socket.poll_read(cx, &mut *this.buf)
     }
 }
 
@@ -101,16 +90,10 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
 
-        while !this.buf.is_empty() {
-            match this.socket.try_write(this.buf) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready!(this.socket.poll_write_ready(cx))?;
-                }
-                ready => return Poll::Ready(ready),
-            }
+        if this.buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-
-        Poll::Ready(Ok(0))
+        this.socket.poll_write(cx, this.buf)
     }
 }
 
@@ -158,20 +141,16 @@ impl WithSocket for SocketIntoBox {
 }
 
 impl<S: Socket + ?Sized> Socket for Box<S> {
-    fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
-        (**self).try_read(buf)
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut dyn ReadBuf,
+    ) -> Poll<io::Result<usize>> {
+        (**self).poll_read(cx, buf)
     }
 
-    fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (**self).try_write(buf)
-    }
-
-    fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (**self).poll_read_ready(cx)
-    }
-
-    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        (**self).poll_write_ready(cx)
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        (**self).poll_write(cx, buf)
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

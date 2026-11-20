@@ -82,7 +82,7 @@ workspace = true
 optional = true
 
 [dependencies.futures-io]
-version = "0.3.32"
+workspace = true
 optional = true
 
 [dev-dependencies.sqlx]

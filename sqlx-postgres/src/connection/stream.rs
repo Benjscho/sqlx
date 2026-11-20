@@ -8,8 +8,6 @@ use crate::message::{
     BackendMessage, BackendMessageFormat, EncodeMessage, FrontendMessage, Notice, Notification,
     ParameterStatus, ReceivedMessage,
 };
-#[cfg(any(feature = "_rt-tokio", feature = "_rt-async-io"))]
-use crate::net::WithSocket;
 use crate::net::{self, BufferedSocket, Socket};
 use crate::{PgConnectOptions, PgDatabaseError, PgSeverity};
 use futures_channel::mpsc::UnboundedSender;
@@ -72,6 +70,8 @@ impl PgStream {
         socket: S,
         options: &PgConnectOptions,
     ) -> Result<Self, Error> {
+        use crate::net::WithSocket;
+
         let socket = MaybeUpgradeTls(options).with_socket(socket).await?;
 
         Ok(Self {

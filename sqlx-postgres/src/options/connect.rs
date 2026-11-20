@@ -34,3 +34,45 @@ impl ConnectOptions for PgConnectOptions {
         self
     }
 }
+
+#[cfg(feature = "_rt-tokio")]
+impl PgConnectOptions {
+    /// Connect over a pre-connected tokio stream.
+    ///
+    /// Performs the database handshake and negotiates TLS using these options.
+    /// The configured hostname is still used for TLS certificate verification.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sqlx::postgres::PgConnectOptions;
+    ///
+    /// # async fn example() -> Result<(), sqlx::Error> {
+    /// let stream = tokio::net::TcpStream::connect("127.0.0.1:5432").await?;
+    /// let conn = PgConnectOptions::new()
+    ///     .connect_with_stream_tokio(stream)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_with_stream_tokio<S>(&self, stream: S) -> Result<PgConnection, Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        PgConnection::establish_with_socket(crate::net::TokioStream::new(stream), self).await
+    }
+}
+
+#[cfg(feature = "_rt-async-io")]
+impl PgConnectOptions {
+    /// Connect over a pre-connected futures stream.
+    ///
+    /// Performs the database handshake and negotiates TLS using these options.
+    /// The configured hostname is still used for TLS certificate verification.
+    pub async fn connect_with_stream_futures<S>(&self, stream: S) -> Result<PgConnection, Error>
+    where
+        S: futures_io::AsyncRead + futures_io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        PgConnection::establish_with_socket(crate::net::FuturesStream::new(stream), self).await
+    }
+}

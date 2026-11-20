@@ -2383,122 +2383,83 @@ async fn it_rolls_back_a_transaction_cancelled_during_begin() -> anyhow::Result<
     Ok(())
 }
 
-#[cfg(feature = "_rt-tokio")]
-#[sqlx_macros::test]
-async fn it_connects_raw_tokio() -> anyhow::Result<()> {
-    setup_if_needed();
+mod custom_transport {
+    use super::*;
 
-    let db_url = env::var("DATABASE_URL")?;
-    let options: PgConnectOptions = db_url.parse()?;
-
-    let stream =
-        tokio::net::TcpStream::connect(format!("{}:{}", options.get_host(), options.get_port()))
+    async fn check_connection(
+        mut conn: PgConnection,
+        options: &PgConnectOptions,
+    ) -> anyhow::Result<()> {
+        conn.ping().await?;
+        let value: (i32,) = sqlx::query_as("SELECT 1 + 1").fetch_one(&mut conn).await?;
+        assert_eq!(value.0, 2);
+        let payload = "custom transport ".repeat(2048);
+        let echoed: String = sqlx::query_scalar("SELECT $1::text")
+            .bind(&payload)
+            .fetch_one(&mut conn)
             .await?;
+        assert_eq!(echoed, payload);
+        if matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Require
+                | sqlx::postgres::PgSslMode::VerifyCa
+                | sqlx::postgres::PgSslMode::VerifyFull
+        ) {
+            let ssl: bool =
+                sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                    .fetch_one(&mut conn)
+                    .await?;
+            assert!(ssl, "TLS required by connection options");
+        }
+        conn.close().await?;
+        Ok(())
+    }
 
-    let mut conn = PgConnection::connect_raw_tokio(stream, &options).await?;
-    conn.ping().await?;
+    #[cfg(feature = "_rt-tokio")]
+    mod tokio {
+        use super::*;
 
-    let value: (i32,) = sqlx::query_as("SELECT 1 + 1").fetch_one(&mut conn).await?;
-    assert_eq!(value.0, 2);
+        #[sqlx_macros::test]
+        async fn connects_with_stream() -> anyhow::Result<()> {
+            setup_if_needed();
+            let options: PgConnectOptions = env::var("DATABASE_URL")?.parse()?;
+            for _ in 0..2 {
+                let stream =
+                    ::tokio::net::TcpStream::connect((options.get_host(), options.get_port()))
+                        .await?;
+                // Require flushing and exercise short writes through a custom transport.
+                let stream = ::tokio::io::BufStream::with_capacity(64, 64, stream);
+                let conn = options.connect_with_stream_tokio(stream).await?;
+                check_connection(conn, &options).await?;
+            }
+            Ok(())
+        }
+    }
 
-    Ok(())
-}
+    #[cfg(any(
+        feature = "_rt-async-std",
+        feature = "_rt-smol",
+        feature = "_rt-async-global-executor"
+    ))]
+    mod futures {
+        use super::*;
 
-#[cfg(all(
-    feature = "_rt-tokio",
-    any(
-        feature = "tls-native-tls",
-        feature = "tls-rustls",
-        feature = "tls-rustls-aws-lc-rs",
-        feature = "tls-rustls-ring",
-        feature = "tls-rustls-ring-webpki",
-        feature = "tls-rustls-ring-native-roots",
-    )
-))]
-#[sqlx_macros::test]
-async fn it_connects_raw_tokio_with_tls() -> anyhow::Result<()> {
-    setup_if_needed();
-
-    let db_url = env::var("DATABASE_URL")?;
-    let options: PgConnectOptions = db_url
-        .parse::<PgConnectOptions>()?
-        .ssl_mode(sqlx::postgres::PgSslMode::Require);
-
-    let stream =
-        tokio::net::TcpStream::connect(format!("{}:{}", options.get_host(), options.get_port()))
-            .await?;
-
-    let mut conn = PgConnection::connect_raw_tokio(stream, &options).await?;
-    conn.ping().await?;
-
-    // Verify TLS is actually in use by checking the connection's SSL status
-    let ssl: bool = sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
-        .fetch_one(&mut conn)
-        .await?;
-    assert!(ssl, "expected connection to be using TLS");
-
-    Ok(())
-}
-
-#[cfg(feature = "_rt-async-std")]
-#[sqlx_macros::test]
-async fn it_connects_raw_futures() -> anyhow::Result<()> {
-    setup_if_needed();
-
-    let db_url = env::var("DATABASE_URL")?;
-    let options: PgConnectOptions = db_url.parse()?;
-
-    let stream = async_std::net::TcpStream::connect(format!(
-        "{}:{}",
-        options.get_host(),
-        options.get_port()
-    ))
-    .await?;
-
-    let mut conn = PgConnection::connect_raw_futures(stream, &options).await?;
-    conn.ping().await?;
-
-    let value: (i32,) = sqlx::query_as("SELECT 1 + 1").fetch_one(&mut conn).await?;
-    assert_eq!(value.0, 2);
-
-    Ok(())
-}
-
-#[cfg(all(
-    feature = "_rt-async-std",
-    any(
-        feature = "tls-native-tls",
-        feature = "tls-rustls",
-        feature = "tls-rustls-aws-lc-rs",
-        feature = "tls-rustls-ring",
-        feature = "tls-rustls-ring-webpki",
-        feature = "tls-rustls-ring-native-roots",
-    )
-))]
-#[sqlx_macros::test]
-async fn it_connects_raw_futures_with_tls() -> anyhow::Result<()> {
-    setup_if_needed();
-
-    let db_url = env::var("DATABASE_URL")?;
-    let options: PgConnectOptions = db_url
-        .parse::<PgConnectOptions>()?
-        .ssl_mode(sqlx::postgres::PgSslMode::Require);
-
-    let stream = async_std::net::TcpStream::connect(format!(
-        "{}:{}",
-        options.get_host(),
-        options.get_port()
-    ))
-    .await?;
-
-    let mut conn = PgConnection::connect_raw_futures(stream, &options).await?;
-    conn.ping().await?;
-
-    // Verify TLS is actually in use by checking the connection's SSL status
-    let ssl: bool = sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
-        .fetch_one(&mut conn)
-        .await?;
-    assert!(ssl, "expected connection to be using TLS");
-
-    Ok(())
+        #[sqlx_macros::test]
+        async fn connects_with_stream() -> anyhow::Result<()> {
+            setup_if_needed();
+            let options: PgConnectOptions = env::var("DATABASE_URL")?.parse()?;
+            for _ in 0..2 {
+                let address = std::net::ToSocketAddrs::to_socket_addrs(&(
+                    options.get_host(),
+                    options.get_port(),
+                ))?
+                .next()
+                .expect("database address");
+                let stream = async_io::Async::<std::net::TcpStream>::connect(address).await?;
+                let conn = options.connect_with_stream_futures(stream).await?;
+                check_connection(conn, &options).await?;
+            }
+            Ok(())
+        }
+    }
 }

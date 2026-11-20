@@ -83,7 +83,15 @@ async fn request_upgrade(
     // To initiate an SSL-encrypted connection, the frontend initially sends an
     // SSLRequest message rather than a StartupMessage
 
-    socket.write(SslRequest::BYTES).await?;
+    let mut request = SslRequest::BYTES;
+    while !request.is_empty() {
+        let written = socket.write(request).await?;
+        if written == 0 {
+            return Err(Error::Io(io::ErrorKind::WriteZero.into()));
+        }
+        request = &request[written..];
+    }
+    socket.flush().await?;
 
     // The server then responds with a single byte containing S or N, indicating that
     // it is willing or unwilling to perform SSL, respectively.
@@ -123,28 +131,46 @@ mod tests {
 
     struct MockSocket {
         read_byte: Option<u8>,
+        written: Vec<u8>,
+        write_limit: usize,
+        flushed: bool,
+    }
+
+    impl Default for MockSocket {
+        fn default() -> Self {
+            Self {
+                read_byte: None,
+                written: Vec::new(),
+                write_limit: usize::MAX,
+                flushed: false,
+            }
+        }
     }
 
     impl Socket for MockSocket {
-        fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize> {
-            match self.read_byte {
+        fn poll_read(
+            &mut self,
+            _cx: &mut Context<'_>,
+            buf: &mut dyn ReadBuf,
+        ) -> Poll<io::Result<usize>> {
+            assert!(self.flushed, "SSLRequest must be flushed before reading");
+            Poll::Ready(match self.read_byte {
                 Some(b) => {
                     buf.put_slice(&[b]);
                     Ok(1)
                 }
-                None => Ok(0), // EOF
-            }
+                None => Ok(0),
+            })
         }
 
-        fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            Ok(buf.len())
+        fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let len = buf.len().min(self.write_limit);
+            self.written.extend_from_slice(&buf[..len]);
+            Poll::Ready(Ok(len))
         }
 
-        fn poll_read_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_write_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushed = true;
             Poll::Ready(Ok(()))
         }
 
@@ -169,7 +195,7 @@ mod tests {
     #[test]
     fn test_request_upgrade_eof() {
         poll_immediate(async {
-            let mut socket = MockSocket { read_byte: None };
+            let mut socket = MockSocket::default();
             let options = PgConnectOptions::new();
             let err = request_upgrade(&mut socket, &options).await.unwrap_err();
 
@@ -187,6 +213,7 @@ mod tests {
         poll_immediate(async {
             let mut socket = MockSocket {
                 read_byte: Some(0x00),
+                ..Default::default()
             };
             let options = PgConnectOptions::new();
             let err = request_upgrade(&mut socket, &options).await.unwrap_err();
@@ -205,6 +232,7 @@ mod tests {
         poll_immediate(async {
             let mut socket = MockSocket {
                 read_byte: Some(b'S'),
+                ..Default::default()
             };
             let options = PgConnectOptions::new();
             let res = request_upgrade(&mut socket, &options).await.unwrap();
@@ -217,6 +245,7 @@ mod tests {
         poll_immediate(async {
             let mut socket = MockSocket {
                 read_byte: Some(b'N'),
+                ..Default::default()
             };
             let options = PgConnectOptions::new();
             let res = request_upgrade(&mut socket, &options).await.unwrap();
@@ -229,6 +258,7 @@ mod tests {
         poll_immediate(async {
             let mut socket = MockSocket {
                 read_byte: Some(0x42),
+                ..Default::default()
             };
             let options = PgConnectOptions::new();
             let err = request_upgrade(&mut socket, &options).await.unwrap_err();
@@ -240,5 +270,26 @@ mod tests {
                 other => panic!("expected Error::Protocol, but got: {:?}", other),
             }
         });
+    }
+    #[test]
+    fn ssl_request_handles_partial_writes_and_flushes() {
+        let mut socket = MockSocket {
+            read_byte: Some(b'S'),
+            write_limit: 2,
+            ..Default::default()
+        };
+        assert!(poll_immediate(request_upgrade(&mut socket, &PgConnectOptions::new())).unwrap());
+        assert_eq!(socket.written, SslRequest::BYTES);
+    }
+
+    #[test]
+    fn ssl_request_rejects_write_zero() {
+        let mut socket = MockSocket {
+            write_limit: 0,
+            ..Default::default()
+        };
+        let error =
+            poll_immediate(request_upgrade(&mut socket, &PgConnectOptions::new())).unwrap_err();
+        assert!(matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::WriteZero));
     }
 }
